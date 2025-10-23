@@ -1,16 +1,15 @@
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status, Query
 from sqlalchemy import create_engine, Column, Integer, String, Float, Date, func
-from sqlalchemy.orm import Session, sessionmaker, declarative_base
-from pydantic import BaseModel, ConfigDict
-import datetime
-from typing import Optional, List
+from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.ext.declarative import declarative_base
+from datetime import date as dt_date
+from pydantic import BaseModel
+from typing import List, Optional
 
 DATABASE_URL = "sqlite:///./expenses.db"
-
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
-
 app = FastAPI()
 
 class Expense(Base):
@@ -18,8 +17,8 @@ class Expense(Base):
     id = Column(Integer, primary_key=True, index=True)
     title = Column(String, index=True)
     category = Column(String, index=True)
-    amount = Column(Float)
-    date = Column(Date, default=datetime.date.today)
+    amount = Column(Float, index=True)
+    date = Column(Date, default=dt_date.today)
 
 Base.metadata.create_all(bind=engine)
 
@@ -34,87 +33,86 @@ class ExpenseCreate(BaseModel):
     title: str
     category: str
     amount: float
-    date: Optional[datetime.date] = None
+    date: Optional[dt_date] = None
+
+class ExpenseUpdate(BaseModel):
+    title: Optional[str] = None
+    category: Optional[str] = None
+    amount: Optional[float] = None
+    date: Optional[dt_date] = None
 
 class ExpenseResponse(BaseModel):
     id: int
     title: str
     category: str
     amount: float
-    date: datetime.date
-    model_config = ConfigDict(from_attributes=True)
+    date: dt_date
+    class Config:
+        from_attributes = True
 
-class ExpenseUpdate(BaseModel):
-    title: Optional[str] = None
-    category: Optional[str] = None
-    amount: Optional[float] = None
-    date: Optional[datetime.date] = None
-
-class SummaryResponse(BaseModel):
-    category: str
-    total_amount: float
-    model_config = ConfigDict(from_attributes=True)
-
-@app.post("/expenses/", response_model=ExpenseResponse, status_code=status.HTTP_201_CREATED)
+@app.post("/expenses", response_model=ExpenseResponse, status_code=status.HTTP_201_CREATED)
 def create_expense(expense: ExpenseCreate, db: Session = Depends(get_db)):
-    new_expense = Expense(
-        title=expense.title,
-        category=expense.category,
-        amount=expense.amount,
-        date=expense.date or datetime.date.today()
-    )
-    db.add(new_expense)
+    exp_date = expense.date or dt_date.today()
+    db_expense = Expense(title=expense.title, category=expense.category, amount=expense.amount, date=exp_date)
+    db.add(db_expense)
     db.commit()
-    db.refresh(new_expense)
-    return new_expense
+    db.refresh(db_expense)
+    return db_expense
 
-@app.get("/expenses/", response_model=List[ExpenseResponse], status_code=status.HTTP_200_OK)
+@app.get("/expenses", response_model=List[ExpenseResponse], status_code=status.HTTP_200_OK)
 def get_expenses(category: Optional[str] = None, sort: Optional[str] = None, db: Session = Depends(get_db)):
     query = db.query(Expense)
     if category:
-        query = query.filter(Expense.category == category)
+        query = query.filter(Expense.category.ilike(f"%{category}%"))
     if sort == "amount":
         query = query.order_by(Expense.amount)
     elif sort == "date":
         query = query.order_by(Expense.date)
     expenses = query.all()
     if not expenses:
-        raise HTTPException(status_code=404, detail="No expenses found")
+        raise HTTPException(status_code=status.HTTP_204_NO_CONTENT, detail="No expenses found")
     return expenses
 
-@app.get("/expenses/{expense_id}", response_model=ExpenseResponse, status_code=status.HTTP_200_OK)
-def get_expense_by_id(expense_id: int, db: Session = Depends(get_db)):
-    expense = db.query(Expense).filter(Expense.id == expense_id).first()
-    if not expense:
-        raise HTTPException(status_code=404, detail="Expense not found")
-    return expense
+@app.get("/expenses/summary", status_code=status.HTTP_200_OK)
+def get_summary(
+    page: int = Query(1, ge=1),
+    limit: int = Query(10, ge=1),
+    db: Session = Depends(get_db)
+):
+    offset = (page - 1) * limit
+    result = (
+        db.query(Expense.category, func.sum(Expense.amount).label("total_amount"))
+        .group_by(Expense.category)
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    if not result:
+        raise HTTPException(status_code=status.HTTP_204_NO_CONTENT, detail="No data found")
+    return [{"category": r[0], "total_amount": r[1]} for r in result]
 
-@app.put("/expenses/{expense_id}", response_model=ExpenseResponse, status_code=status.HTTP_200_OK)
-def update_expense(expense_id: int, expense: ExpenseUpdate, db: Session = Depends(get_db)):
-    db_expense = db.query(Expense).filter(Expense.id == expense_id).first()
+@app.put("/expenses/{id}", response_model=ExpenseResponse, status_code=status.HTTP_202_ACCEPTED)
+def update_expense(id: int, expense: ExpenseUpdate, db: Session = Depends(get_db)):
+    db_expense = db.query(Expense).filter(Expense.id == id).first()
     if not db_expense:
-        raise HTTPException(status_code=404, detail="Expense not found")
-    for field, value in expense.dict(exclude_unset=True).items():
-        setattr(db_expense, field, value)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Expense not found")
+    if expense.title is not None:
+        db_expense.title = expense.title
+    if expense.category is not None:
+        db_expense.category = expense.category
+    if expense.amount is not None:
+        db_expense.amount = expense.amount
+    if expense.date is not None:
+        db_expense.date = expense.date
     db.commit()
     db.refresh(db_expense)
     return db_expense
 
-@app.delete("/expenses/{expense_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_expense(expense_id: int, db: Session = Depends(get_db)):
-    db_expense = db.query(Expense).filter(Expense.id == expense_id).first()
+@app.delete("/expenses/{id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_expense(id: int, db: Session = Depends(get_db)):
+    db_expense = db.query(Expense).filter(Expense.id == id).first()
     if not db_expense:
-        raise HTTPException(status_code=404, detail="Expense not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Expense not found")
     db.delete(db_expense)
     db.commit()
     return
-
-@app.get("/expenses/summary", response_model=List[SummaryResponse], status_code=status.HTTP_200_OK)
-def get_summary(db: Session = Depends(get_db)):
-    summary = db.query(
-        Expense.category,
-        func.sum(Expense.amount).label("total_amount")
-    ).group_by(Expense.category).all()
-    if not summary:
-        raise HTTPException(status_code=404, detail="No data available for summary")
-    return [{"category": s[0], "total_amount": s[1]} for s in summary]
